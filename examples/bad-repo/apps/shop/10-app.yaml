@@ -1,0 +1,28 @@
+# R1: tag instead of digest. R2: local-only image. R3: no readinessProbe / memory limit.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: shop, namespace: shop}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: shop}}
+  template:
+    metadata: {labels: {app: shop}}
+    spec:
+      initContainers:
+      - name: migrate
+        image: localhost:5000/shop-migrate@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      containers:
+      - name: shop
+        image: nginx:1.27
+---
+# R5: plaintext Secret in a file that is not encrypted (dummy value, not a real credential).
+apiVersion: v1
+kind: Secret
+metadata: {name: shop-db, namespace: shop}
+stringData: {PASSWORD: dummy-not-a-secret}
+---
+# R6: PVC without prune guard.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: shop-data, namespace: shop}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}

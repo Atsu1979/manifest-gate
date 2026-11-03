@@ -4,4 +4,4 @@ Admission rules in the cluster reject a bad object only *after* it has been merg
 which leaves the GitOps controller stuck and the culprit change hard to find. This tool applies
 the same conditions to the manifests in the pull request, before merge.
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"

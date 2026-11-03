@@ -1,0 +1,6 @@
+# Deliberately broken: CI asserts that the gate FAILS on this repository.
+# R6: no prune guard. R4: no default-deny ingress NetworkPolicy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop

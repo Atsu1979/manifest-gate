@@ -1,16 +1,39 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions: {contents: read}
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
-      matrix: {python: ["3.10", "3.12", "3.13"]}
+      fail-fast: false
+      matrix: {python: ["3.10", "3.11", "3.12", "3.13"]}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "${{ matrix.python }}"}
+        with:
+          python-version: "${{ matrix.python }}"
+          cache: pip
+          cache-dependency-path: pyproject.toml
       - run: pip install -e ".[test]"
-      - run: python -m pytest -q
-      - name: dogfood - run the gate on the example
+      - name: lint
+        run: ruff check .
+      - name: test (with coverage floor)
+        run: python -m pytest -q --cov=manifest_gate --cov-report=term-missing --cov-fail-under=90
+      - name: dogfood - the good example must pass
         run: manifest-gate examples/repo -c examples/manifest-gate.yaml
+      - name: dogfood - the bad example must fail with exit code 1
+        run: |
+          set +e
+          manifest-gate examples/bad-repo
+          rc=$?
+          set -e
+          test "$rc" -eq 1 || { echo "expected exit 1, got $rc"; exit 1; }
+      - name: benchmark (smoke, numbers in the log)
+        run: python bench/bench.py --namespaces 200 --repeat 3

@@ -1,7 +1,7 @@
 # Example config. Put it at the repository root as manifest-gate.yaml.
 # Namespaces where workloads must have a readinessProbe and a memory limit (mirror your admission rule).
 health_namespaces: [web, api]
-# Apps that are allowed to run without a readinessProbe (batch workers, sidecar builders).
+# Apps exempt from R3 (readinessProbe + memory limit), e.g. batch workers. Matched on the pod template label `app`.
 health_exempt_apps: [nightly-worker]
 # Image prefixes that only exist on a node or an ad-hoc registry.
 local_image_prefixes: ["docker.io/local/", "localhost:", "127.0.0.1:"]
@@ -9,7 +9,8 @@ local_image_prefixes: ["docker.io/local/", "localhost:", "127.0.0.1:"]
 encrypted_suffix: .sops.yaml
 # Paths whose Namespaces / PVCs must opt out of GitOps pruning.
 app_paths: ["apps/"]
-# Known exceptions: a reason and a review date are mandatory; expired or stale ones fail the gate.
+# Known exceptions: match (substring of a FAIL line), reason and review_by (YYYY-MM-DD) are mandatory;
+# expired or stale ones fail the gate. Unknown keys in this file are an error (exit 2).
 exceptions:
   - match: "R4 namespace policy-engine:"
     reason: admission webhooks need ingress from the API server; add a scoped allow rule first
