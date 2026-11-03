@@ -6,6 +6,13 @@ from manifest_gate.check import Config, check, main
 
 DIGEST = "nginx@sha256:" + "a" * 64
 GUARD = "annotations: {kustomize.toolkit.fluxcd.io/prune: disabled}"
+SOPS_SECRET = textwrap.dedent("""\
+    apiVersion: v1
+    kind: Secret
+    metadata: {name: s, namespace: web}
+    data: {K: "ENC[AES256_GCM,data:AAAA,iv:BBBB,tag:CCCC,type:str]"}
+    sops: {lastmodified: "2026-01-01T00:00:00Z", mac: "ENC[AES256_GCM,data:DDDD,type:str]", version: 3.9.0}
+    """)
 
 
 def ns(name, guarded=True):
@@ -94,8 +101,28 @@ def test_plaintext_secret_fails_encrypted_file_passes(tmp_path):
     sec = "apiVersion: v1\nkind: Secret\nmetadata: {name: s, namespace: web}\nstringData: {K: v}\n"
     errs, _ = run(tmp_path, {"apps/web/ns.yaml": ns("web"), "apps/web/s.yaml": sec})
     assert codes(errs) == {"R5"}
-    (tmp_path / "apps/web/s.yaml").rename(tmp_path / "apps/web/s.sops.yaml")
-    errs, _ = run(tmp_path, {})
+    (tmp_path / "apps/web/s.yaml").unlink()
+    errs, _ = run(tmp_path, {"apps/web/s.sops.yaml": SOPS_SECRET})
+    assert errs == []
+
+
+def test_plaintext_secret_renamed_to_sops_still_fails(tmp_path):
+    """Renaming a file is not encryption: no sops block, or plaintext stringData, must fail."""
+    plain = "apiVersion: v1\nkind: Secret\nmetadata: {name: s, namespace: web}\nstringData: {K: v}\n"
+    errs, _ = run(tmp_path, {"apps/web/ns.yaml": ns("web"), "apps/web/s.sops.yaml": plain})
+    assert codes(errs) == {"R5"} and any("not encrypted" in e for e in errs)
+    data_no_sops = "apiVersion: v1\nkind: Secret\nmetadata: {name: s, namespace: web}\ndata: {K: dg==}\n"
+    errs, _ = run(tmp_path, {"apps/web/s.sops.yaml": data_no_sops})
+    assert codes(errs) == {"R5"}
+    one_plain = SOPS_SECRET.replace("data: {K: ", "data: {PLAIN: dg==, K: ")
+    errs, _ = run(tmp_path, {"apps/web/s.sops.yaml": one_plain})
+    assert codes(errs) == {"R5"}
+
+
+def test_sops_encrypted_stringdata_passes(tmp_path):
+    """SOPS encrypts stringData values too; an encrypted stringData Secret is fine."""
+    sec = SOPS_SECRET.replace("data: {K:", "stringData: {K:")
+    errs, _ = run(tmp_path, {"apps/web/ns.yaml": ns("web"), "apps/web/s.sops.yaml": sec})
     assert errs == []
 
 
