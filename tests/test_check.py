@@ -91,10 +91,20 @@ def test_namespace_without_default_deny_fails(tmp_path):
 
 
 def test_plaintext_secret_fails_encrypted_file_passes(tmp_path):
+    # 平文Secretは R5。中身が実際に暗号化(SOPS)されていれば pass。
+    # 以前はファイル名を .sops.yaml にするだけで pass していた（監査 FP-1380 F-4）。
+    # 名前だけ変えても中身が平文なら pass しないことを合わせて確認する。
     sec = "apiVersion: v1\nkind: Secret\nmetadata: {name: s, namespace: web}\nstringData: {K: v}\n"
     errs, _ = run(tmp_path, {"apps/web/ns.yaml": ns("web"), "apps/web/s.yaml": sec})
     assert codes(errs) == {"R5"}
+    # 名前だけ .sops.yaml に変えても中身が平文なら依然 R5
     (tmp_path / "apps/web/s.yaml").rename(tmp_path / "apps/web/s.sops.yaml")
+    errs, _ = run(tmp_path, {})
+    assert codes(errs) == {"R5"}
+    # 中身を実際に暗号化（ENC[...] と sops.mac）すれば pass
+    enc = ("apiVersion: v1\nkind: Secret\nmetadata: {name: s, namespace: web}\n"
+           "data: {K: 'ENC[AES256_GCM,data:zz,type:str]'}\nsops: {mac: 'ENC[AES256_GCM,data:qq]'}\n")
+    (tmp_path / "apps/web/s.sops.yaml").write_text(enc)
     errs, _ = run(tmp_path, {})
     assert errs == []
 
