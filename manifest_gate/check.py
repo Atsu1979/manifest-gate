@@ -15,6 +15,15 @@ but the pods will be rejected the moment someone scales them back up.
 Known exceptions live in the config with a reason and a review date. An exception without a
 reason, an expired exception, and an exception that no longer matches anything all fail the gate,
 so exceptions cannot be left behind silently.
+
+Evasion hardening (audit FP-1380):
+  - `kind: List` / `*List` wrappers are flattened so nested objects are inspected.
+  - `.json` manifests are scanned too (kustomize/kubectl accept them).
+  - skip paths match on path boundaries, not as a free substring.
+  - the config file is skipped only by its exact name, not any `manifest-gate*` file.
+  - R5 verifies the content is actually SOPS-encrypted, not just the filename.
+  - exceptions must name a rule code and match the start of a violation; parse errors
+    and an unset namespace are never silently exempted; a bad review_by date fails cleanly.
 """
 from __future__ import annotations
 
@@ -22,6 +31,7 @@ import argparse
 import datetime as dt
 import glob
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -29,6 +39,9 @@ import yaml
 
 WORKLOADS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"}
 PRUNE_ANNOTATION = "kustomize.toolkit.fluxcd.io/prune"
+CONFIG_NAMES = {"manifest-gate.yaml", "manifest-gate.yml"}
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}(?![0-9a-f])")  # 正しい digest のみ（未アンカー部分一致を塞ぐ）
+RULE_CODE = re.compile(r"^(R[1-6]|EX)\b")  # 例外で抑制してよいのは規則由来の違反だけ（parse error 等は対象外）
 
 
 @dataclass
@@ -60,14 +73,40 @@ class Config:
         return c
 
 
+def _expand(d):
+    """kind: List / *List の items[] を再帰的に平らにする。
+    包むだけで全規則を外せる回避(FP-1380 F-1)を塞ぐ。"""
+    if isinstance(d, dict) and isinstance(d.get("kind"), str) and d["kind"].endswith("List") \
+            and isinstance(d.get("items"), list):
+        for it in d["items"]:
+            yield from _expand(it)
+    elif isinstance(d, dict) and "kind" in d:
+        yield d
+
+
+def _skipped(rel: str, cfg: Config) -> bool:
+    """skip_paths をパス境界で判定する（自由部分一致だと任意階層 charts/ 等に隠せる）。"""
+    rel = rel.replace(os.sep, "/")
+    base = os.path.basename(rel)
+    if base in CONFIG_NAMES:  # 設定ファイルは完全一致でのみ除外（manifest-gate* 前方一致にしない）
+        return True
+    for s in cfg.skip_paths:
+        seg = s.strip("/")
+        if seg and (rel == seg or rel.startswith(seg + "/")):
+            return True
+    return False
+
+
 def iter_docs(root: str, cfg: Config):
-    for path in sorted(glob.glob(os.path.join(root, "**/*.y*ml"), recursive=True)):
+    paths = glob.glob(os.path.join(root, "**/*.y*ml"), recursive=True) \
+        + glob.glob(os.path.join(root, "**/*.json"), recursive=True)
+    for path in sorted(set(paths)):
         rel = os.path.relpath(path, root)
-        if any(s in "/" + rel for s in cfg.skip_paths) or os.path.basename(path).startswith("manifest-gate"):
+        if _skipped(rel, cfg):
             continue
         try:
-            for d in yaml.safe_load_all(open(path, encoding="utf-8")):
-                if isinstance(d, dict) and "kind" in d and "apiVersion" in d:
+            for raw in yaml.safe_load_all(open(path, encoding="utf-8")):  # YAML は JSON の上位集合
+                for d in _expand(raw):
                     yield rel, d
         except yaml.YAMLError as e:
             yield rel, {"kind": "__parse_error__", "error": str(e)[:200]}
@@ -82,6 +121,18 @@ def pod_spec(d: dict) -> dict:
     return (spec.get("template") or {}).get("spec") or {}
 
 
+def _is_encrypted(d: dict) -> bool:
+    """中身が実際に SOPS で暗号化されているか（ファイル名だけでは判断しない）。"""
+    sops = d.get("sops")
+    if isinstance(sops, dict) and sops.get("mac"):
+        return True
+    for fld in ("data", "stringData"):
+        vals = d.get(fld)
+        if isinstance(vals, dict) and vals and all(isinstance(v, str) and v.startswith("ENC[") for v in vals.values()):
+            return True
+    return False
+
+
 def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[str], list[str]]:
     """Return (errors, warnings)."""
     today = today or dt.date.today()
@@ -92,7 +143,8 @@ def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[st
 
     for path, d in iter_docs(root, cfg):
         kind, md = d["kind"], d.get("metadata") or {}
-        ns = md.get("namespace", "default")
+        ns_declared = md.get("namespace")  # 無記載を default と同一視しない（免除の連鎖を断つ）
+        ns = ns_declared or "default"
         if kind == "__parse_error__":
             errs.append(f"{path}: cannot parse YAML: {d['error']}")
             continue
@@ -102,8 +154,12 @@ def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[st
             sp = d.get("spec") or {}
             if sp.get("podSelector") in ({}, None) and "Ingress" in (sp.get("policyTypes") or []) and not sp.get("ingress"):
                 denied.add(ns)
-        if kind == "Secret" and not path.endswith(cfg.encrypted_suffix) and (d.get("data") or d.get("stringData")):
-            errs.append(f"R5 {path}: Secret/{md.get('name')} holds data outside an encrypted file")
+        if kind == "Secret":
+            has_data = bool(d.get("data") or d.get("stringData"))
+            if has_data and not _is_encrypted(d):
+                errs.append(f"R5 {path}: Secret/{md.get('name')} holds plaintext data (not SOPS-encrypted)")
+            elif path.endswith(cfg.encrypted_suffix) and not _is_encrypted(d):
+                errs.append(f"R5 {path}: Secret/{md.get('name')} is named as encrypted but is not SOPS-encrypted")
         if kind in ("Namespace", "PersistentVolumeClaim") and path.startswith(cfg.app_paths) and \
                 (md.get("annotations") or {}).get(PRUNE_ANNOTATION) != "disabled":
             errs.append(f"R6 {path}: {kind}/{md.get('name')} is not protected from pruning ({PRUNE_ANNOTATION}: disabled)")
@@ -116,14 +172,16 @@ def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[st
         before = len(errs)
         for c in (ps.get("containers") or []) + (ps.get("initContainers") or []):
             img = c.get("image", "")
-            if ns not in cfg.digest_exempt_namespaces and "@sha256:" not in img:
+            if ns_declared not in cfg.digest_exempt_namespaces and not DIGEST.search(img):
                 errs.append(f"R1 {name}: container {c.get('name')} image is not pinned by digest: {img}")
             if img.startswith(cfg.local_image_prefixes):
                 errs.append(f"R2 {name}: container {c.get('name')} uses a local-only image: {img}")
-        app = ((((d.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}).get("app")
+        # R3 の免除は運用側キー(ns/name)で持つ。マニフェスト自身の label.app を信じると自己申告で外せる。
+        wl_name = md.get("name")
+        exempt_health = wl_name in cfg.health_exempt_apps or f"{ns}/{wl_name}" in cfg.health_exempt_apps
         for c in ps.get("containers") or []:
             ok = "readinessProbe" in c and "memory" in ((c.get("resources") or {}).get("limits") or {})
-            if not ok and app not in cfg.health_exempt_apps:
+            if not ok and not exempt_health:
                 msg = f"R3 {name}: container {c.get('name')} lacks a readinessProbe or a memory limit"
                 (errs if ns in cfg.health_namespaces else warns).append(
                     msg if ns in cfg.health_namespaces else msg + " (namespace not covered by the rule)")
@@ -137,7 +195,12 @@ def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[st
     used: set[str] = set()
     kept: list[str] = []
     for e in errs:
-        hit = next((x for x in cfg.exceptions if x.get("match") and x["match"] in e), None)
+        # 例外抑制は規則由来の違反に限る＆match は規則コードで始まり違反行の先頭に一致すること。
+        # これで『container app』のような自由部分一致での一括降格と、parse error の握り潰しを防ぐ。
+        hit = None
+        if RULE_CODE.match(e):
+            hit = next((x for x in cfg.exceptions
+                        if x.get("match") and RULE_CODE.match(str(x["match"])) and e.startswith(str(x["match"]))), None)
         if hit:
             used.add(hit["match"])
             warns.append(e + f" (known exception: {hit.get('reason')}; review by {hit.get('review_by')})")
@@ -146,7 +209,13 @@ def check(root: str, cfg: Config, today: dt.date | None = None) -> tuple[list[st
     for x in cfg.exceptions:
         if not x.get("reason") or not x.get("review_by"):
             kept.append(f"EX exception {x.get('match')!r} needs both reason and review_by")
-        elif dt.date.fromisoformat(str(x["review_by"])) < today:
+            continue
+        try:
+            review_by = dt.date.fromisoformat(str(x["review_by"]))
+        except ValueError:
+            kept.append(f"EX exception {x.get('match')!r} has an invalid review_by: {x['review_by']!r}")
+            continue
+        if review_by < today:
             kept.append(f"EX exception {x.get('match')!r} expired on {x['review_by']}: {x['reason']}")
         elif x.get("match") not in used:
             kept.append(f"EX exception {x.get('match')!r} no longer matches anything - remove it")
