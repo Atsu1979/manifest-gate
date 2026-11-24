@@ -1,0 +1,14 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: web}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: web}}
+  template:
+    metadata: {labels: {app: web}}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        readinessProbe: {httpGet: {path: /, port: 80}}
+        resources: {limits: {memory: 64Mi}}
